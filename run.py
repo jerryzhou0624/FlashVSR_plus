@@ -43,6 +43,7 @@ import os
 import re
 import math
 import uuid
+import time
 import torch
 import shutil
 import imageio
@@ -62,11 +63,96 @@ root = os.path.dirname(os.path.abspath(__file__))
 temp = os.path.join(root, "_temp")
 devices = get_device_list()
 
+class TimeTracker:
+    """时间跟踪器，用于记录各个阶段的耗时"""
+    def __init__(self):
+        self.timings = {}
+        self.start_times = {}
+        
+    def start(self, stage_name):
+        """开始计时一个阶段"""
+        self.start_times[stage_name] = time.time()
+        
+    def end(self, stage_name):
+        """结束计时一个阶段并记录耗时"""
+        if stage_name in self.start_times:
+            elapsed = time.time() - self.start_times[stage_name]
+            if stage_name in self.timings:
+                self.timings[stage_name] += elapsed
+            else:
+                self.timings[stage_name] = elapsed
+            del self.start_times[stage_name]
+            return elapsed
+        return 0
+    
+    def get_timings(self):
+        """获取所有阶段的耗时统计"""
+        return self.timings.copy()
+    
+    def print_summary(self):
+        """打印时间统计摘要"""
+        log("\n" + "="*60, message_type="info")
+        log("[FlashVSR] Time Statistics", message_type="finish")
+        log("="*60, message_type="info")
+        
+        # 阶段名称映射：中文 -> 英文
+        stage_name_map = {
+            "Model Download": "Model Download",
+            "Prepare Input Tensors": "Prepare Input Tensors",
+            "Initialize Pipeline": "Initialize Pipeline",
+            "DiT Inference": "DiT Inference",
+            "DiT Inference (Tiled)": "DiT Inference (Tiled)",
+            "Stitch Video Tiles": "Stitch Video Tiles",
+            "DiT Inference + VAE Decode": "DiT Inference + VAE Decode",
+            "VAE Decode": "VAE Decode",
+            "Save Video": "Save Video",
+            "Merge Audio": "Merge Audio",
+            "Total Time": "Total Time",
+            # 兼容旧的中文名称（如果存在）
+            "模型下载": "Model Download",
+            "准备输入张量": "Prepare Input Tensors",
+            "初始化管道": "Initialize Pipeline",
+            "视频处理(分块)": "DiT Inference (Tiled)",
+            "拼接视频分块": "Stitch Video Tiles",
+            "视频处理": "DiT Inference + VAE Decode",
+            "保存视频": "Save Video",
+            "合并音频": "Merge Audio",
+            "总耗时": "Total Time",
+            # 兼容旧的英文名称
+            "Video Processing (Tiled)": "DiT Inference (Tiled)",
+            "Video Processing": "DiT Inference + VAE Decode",
+        }
+        
+        # 分离"Total Time"和其他阶段
+        total_time_key_en = "Total Time"
+        total_time_key_cn = "总耗时"
+        other_timings = {}
+        for k, v in self.timings.items():
+            if k not in [total_time_key_en, total_time_key_cn]:
+                other_timings[k] = v
+        
+        total_time = self.timings.get(total_time_key_en) or self.timings.get(total_time_key_cn) or sum(other_timings.values())
+        
+        # 计算百分比时使用总耗时作为基准，但不在列表中显示"Total Time"
+        for stage_name, elapsed in sorted(other_timings.items(), key=lambda x: x[1], reverse=True):
+            stage_name_en = stage_name_map.get(stage_name, stage_name)
+            percentage = (elapsed / total_time * 100) if total_time > 0 else 0
+            log(f"  {stage_name_en:30s}: {elapsed:8.2f}s ({percentage:5.1f}%)", message_type="info")
+        
+        log("-"*60, message_type="info")
+        log(f"  Total Time: {total_time:8.2f}s ({total_time/60:.2f}min)", message_type="finish")
+        log("="*60 + "\n", message_type="info")
+
+# 全局时间跟踪器
+timer = TimeTracker()
+
 def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
     model_dir = os.path.join(root, "models", "FlashVSR")
     if not os.path.exists(model_dir):
+        timer.start("Model Download")
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
+        timer.end("Model Download")
 
 def is_ffmpeg_available():
     ffmpeg_path = shutil.which('ffmpeg')
@@ -101,12 +187,14 @@ def is_video(path):
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
 def save_video(frames, save_path, fps=30, quality=5):
+    timer.start("Save Video")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
     w = imageio.get_writer(save_path, fps=fps, quality=quality)
     for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
         w.append_data(frame_np)
     w.close()
+    timer.end("Save Video")
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -119,11 +207,13 @@ def merge_video_with_audio(video_path, audio_source_path):
         log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
         return
     
+    timer.start("Merge Audio")
     try:
         probe = ffmpeg.probe(audio_source_path)
         audio_streams = [s for s in probe['streams'] if s['codec_type'] == 'audio']
         if not audio_streams:
             log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
+            timer.end("Merge Audio")
             return
         log("[FlashVSR] Copying audio tracks...")
         os.rename(video_path, temp)
@@ -134,16 +224,18 @@ def merge_video_with_audio(video_path, audio_source_path):
             vcodec='copy', acodec='copy'
         ).run(overwrite_output=True, quiet=True)
         log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
+        timer.end("Merge Audio")
     except ffmpeg.Error as e:
         print("[ERROR] FFmpeg error during merge:", e.stderr.decode() if e.stderr else "Unknown error")
         log(f"[FlashVSR] Audio merge failed. A silent video has been saved to '{video_path}'.", message_type='warning')
+        timer.end("Merge Audio")
         
     finally:
         if os.path.exists(temp):
             try:
                 os.remove(temp)
             except OSError as e:
-                lgo(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
+                log(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
     
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
@@ -168,6 +260,7 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     return cropped_tensor.squeeze(0)
 
 def prepare_tensors(path: str, dtype=torch.bfloat16):
+    timer.start("Prepare Input Tensors")
     if os.path.isdir(path):
         paths0 = list_images_natural(path)
         if not paths0:
@@ -185,6 +278,7 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
                 
         vid = torch.stack(frames, 0)
         fps = 30
+        timer.end("Prepare Input Tensors")
         return vid, fps
 
     if is_video(path):
@@ -221,8 +315,10 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
             except Exception:
                 pass
         vid = torch.stack(frames, 0)
+        timer.end("Prepare Input Tensors")
         return vid, fps
     
+    timer.end("Prepare Input Tensors")
     raise ValueError(f"Unsupported input: {path}")
 
 def get_input_params(image_tensor, scale):
@@ -439,6 +535,7 @@ def stitch_video_tiles(
                 log(f"Could not remove temporary file '{path}': {e}", message_type='warning')
 
 def init_pipeline(mode, device, dtype):
+    timer.start("Initialize Pipeline")
     model_downlod()
     model_path = os.path.join(root, "models", "FlashVSR")
     if not os.path.exists(model_path):
@@ -482,6 +579,7 @@ def init_pipeline(mode, device, dtype):
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])
+    timer.end("Initialize Pipeline")
     
     return pipe
 
@@ -525,6 +623,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
         
         pipe = init_pipeline(mode, _device, dtype)
         
+        timer.start("DiT Inference (Tiled)")
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             input_tile = frames[:, y1:y2, x1:x2, :]
                 
@@ -572,10 +671,14 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
         
+        timer.end("DiT Inference (Tiled)")
+        
         if mode == "tiny-long":
+            timer.start("Stitch Video Tiles")
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
                 scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True
             )
+            timer.end("Stitch Video Tiles")
             shutil.rmtree(local_temp)
         else:
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
@@ -590,12 +693,14 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
 
         pipe = init_pipeline(mode, _device, dtype)
         log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type='info')
+        timer.start("DiT Inference + VAE Decode")
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
             color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True
         )
+        timer.end("DiT Inference + VAE Decode")
         
         if mode == "tiny-long":
             del pipe, LQ
@@ -610,6 +715,7 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
     return final_output, fps
 
 if __name__ == "__main__":
+    timer.start("Total Time")
     dtype_map = {
         "fp32": torch.float32,
         "fp16": torch.float16,
@@ -617,9 +723,10 @@ if __name__ == "__main__":
     }
     try:
         dtype = dtype_map[args.dtype]
+        print(f"dtype: {dtype}")
     except:
         dtype = torch.bfloat16
-        
+        print(f"dtype: {dtype}")
     if args.attention == "sage":
         wan_video_dit.USE_BLOCK_ATTN = False
     else:
@@ -637,4 +744,8 @@ if __name__ == "__main__":
         save_video(result, final, fps=fps, quality=args.quality)
         
     merge_video_with_audio(final, args.input)
+    timer.end("Total Time")
     log("[FlashVSR] Done.", message_type='finish')
+    
+    # 打印时间统计信息
+    timer.print_summary()

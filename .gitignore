@@ -22,3 +22,14 @@ venv/
 
 # macOS
 .DS_Store
+
+# FlashVSR specific
+.flash/
+_temp/
+*.mp4
+FlashVSR_*.mp4
+bin/
+models/FlashVSR/
+*.pth
+*.ckpt
+*.safetensors

@@ -378,6 +378,18 @@ class FlashVSRTinyPipeline(BasePipeline):
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 
+        # 尝试获取全局 timer（DiT 推理计时）
+        dit_timer = None
+        try:
+            import sys
+            for module_name in ['run', '__main__']:
+                if module_name in sys.modules and hasattr(sys.modules[module_name], 'timer'):
+                    dit_timer = sys.modules[module_name].timer
+                    dit_timer.start("DiT Inference")
+                    break
+        except:
+            pass
+
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
                 if cur_process_idx == 0:
@@ -440,6 +452,13 @@ class FlashVSRTinyPipeline(BasePipeline):
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
                 LQ_pre_idx = LQ_cur_idx
+            
+            # 结束 DiT 推理计时
+            if dit_timer is not None:
+                try:
+                    dit_timer.end("DiT Inference")
+                except:
+                    pass
                 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
@@ -452,7 +471,24 @@ class FlashVSRTinyPipeline(BasePipeline):
             
             # Decode
             print("[FlashVSR] Starting VAE decoding...")
+            # 尝试获取全局 timer（如果存在）
+            timer = None
+            try:
+                import sys
+                # 检查 'run' 模块（导入时）或 '__main__' 模块（直接运行时）
+                for module_name in ['run', '__main__']:
+                    if module_name in sys.modules and hasattr(sys.modules[module_name], 'timer'):
+                        timer = sys.modules[module_name].timer
+                        timer.start("VAE Decode")
+                        break
+            except:
+                pass
             frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+            if timer is not None:
+                try:
+                    timer.end("VAE Decode")
+                except:
+                    pass
             
             self.TCDecoder.clean_mem()
             if force_offload:

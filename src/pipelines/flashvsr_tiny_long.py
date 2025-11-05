@@ -393,6 +393,19 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         LQ_pre_idx = 0
         LQ_cur_idx = 0
         self.TCDecoder.clean_mem()
+        
+        # 尝试获取全局 timer（DiT 推理计时）
+        dit_timer = None
+        try:
+            import sys
+            for module_name in ['run', '__main__']:
+                if module_name in sys.modules and hasattr(sys.modules[module_name], 'timer'):
+                    dit_timer = sys.modules[module_name].timer
+                    dit_timer.start("DiT Inference")
+                    break
+        except:
+            pass
+        
         try:
             with torch.no_grad():
                 for cur_process_idx in progress_bar_cmd(range(process_total_num)):
@@ -457,7 +470,24 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     
                     # Decode
                     cur_LQ_frame = lq_buffer.get_chunk(LQ_pre_idx, LQ_cur_idx).to(self.device)
+                    # 尝试获取全局 timer（如果存在）
+                    timer = None
+                    try:
+                        import sys
+                        # 检查 'run' 模块（导入时）或 '__main__' 模块（直接运行时）
+                        for module_name in ['run', '__main__']:
+                            if module_name in sys.modules and hasattr(sys.modules[module_name], 'timer'):
+                                timer = sys.modules[module_name].timer
+                                timer.start("VAE Decode")
+                                break
+                    except:
+                        pass
                     cur_frames = self.decode_video(cur_latents, cond=cur_LQ_frame)
+                    if timer is not None:
+                        try:
+                            timer.end("VAE Decode")
+                        except:
+                            pass
     
                     # 颜色校正（wavelet）
                     try:
@@ -490,6 +520,13 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     self.TCDecoder.clean_mem()
                     if force_offload:
                         self.offload_model()
+                
+                # 结束 DiT 推理计时
+                if dit_timer is not None:
+                    try:
+                        dit_timer.end("DiT Inference")
+                    except:
+                        pass
     
         except Exception as e:
             print(f"Error: {e}")
